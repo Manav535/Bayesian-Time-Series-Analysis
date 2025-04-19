@@ -1,0 +1,1206 @@
+---
+output: pdf_document
+geometry: top=1in, bottom=1in, left=1.2in, right=1.2in
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require(rstan)
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+# Load necessary libraries
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(scales)
+library(tidyr)
+library(forecast)
+library(tseries)
+library(dlm)
+
+knitr::opts_chunk$set(
+  fig.height = 3,
+  fig.width = 5,
+  fig.align = "center"
+)
+```
+
+## Stat 447 Final Project
+
+**Team:** Manav Doshi
+
+**Github:** <https://github.com/Manav535/Bayesian-Time-Series-Analysis/tree/5cb26b8019a2d5384450bfbefb05305bfb9818bc>
+
+**Introduction**
+
+Accurate forecasting of equity market indices is a central task in financial econometrics, with direct implications for portfolio management, risk assessment, and algorithmic trading. The NIFTY50 index, India's benchmark stock‑market index (analogous to the S&P500 in the U.S.), aggregates the performance of fifty of the largest Indian securities, serving as a barometer of India's economic health. Traditional time‑series approaches often analyze the index in isolation, overlooking valuable information contained in related sectoral indices. However, sector indices (e.g., Information Technology, Financial Services, Healthcare) typically exhibit correlated dynamics with the broader market, especially during periods of sector‑specific shocks or macroeconomic regime changes. The key methodological challenge we address is developing forecasting models that can effectively capture these interrelationships while handling the non-stationary nature of financial time series. This project specifically focuses on time series and state space models as frameworks for this prediction task.
+
+**Literature Review**
+
+Financial time series modeling has evolved significantly to address the challenges of market data. Hendershott and Menkveld (2014) demonstrated how state-space models can decompose financial variables into unobserved components, highlighting their advantage in handling missing values through Kalman filtering - a technique we employ in our comparison of methods. For markets with distinct regimes, Azzouzi and Nabney's work on Switching State Space Models (SSSMs) provides insight into how markets transition between approximately stationary states, particularly relevant for analyzing the market during periods of volatility. Traditional ARIMA models - which serve as our benchmark - remain fundamental despite their limitations. Kane et al. (2014) showed that while ARIMA offers interpretability, it often underperforms newer approaches in capturing the non-linear relationships common in financial markets. These methodological approaches inform our comparative analysis between hierarchical Bayesian state-space modeling, Kalman filtering, and ARIMA forecasting for predicting NIFTY50 movements using both the index itself and related sectoral indices.
+
+**Our Approach**
+
+Based on this methodological foundation, we develop a hierarchical Bayesian state‑space model that jointly leverages the NIFTY50 and multiple sector indices to improve forecast accuracy and quantify predictive uncertainty. We benchmark this approach against standard ARIMA forecasts and Kalman filtering, demonstrating how the Bayesian framework accommodates parameter sharing across sectors, produces full posterior predictive distributions, and enables rigorous uncertainty quantification. Our implementation uses Stan for MCMC sampling, with assessment through posterior diagnostics ($\hat{R}$, effective sample size, E-BFMI, divergences) and out-of-sample performance metrics (RMSE, MAE, MAPE). We aim to forecast the next 60 trading‑day (long enough to matter for strategic decisions but short enough to avoid regime shifts) closing prices of the NIFTY50 index using daily closing prices of the NIFTY50 itself and three sectoral indices: Information Technology (IT), Financial Services (FIN), and Healthcare (HEA).
+
+**Exploratory Plot of the NIFTY50 and Sector Indices**
+
+First, we plot the closing prices of the NIFTY50 and the three sector indices over time to get a feel for their joint dynamics and any broad trends or structural breaks.
+
+```{r, echo=FALSE}
+# Function to read and process each index file
+read_process_index <- function(file_path, index_name) {
+  # Read the data
+  data <- read.csv(file_path)
+  
+  # Process the data
+  data <- data %>%
+    # Convert date column to Date object
+    mutate(date = as.Date(date, format = "%Y-%m-%d %H:%M:%S")) %>%
+    # Add index name column for identification
+    mutate(index = index_name) %>%
+    # Select only the relevant columns
+    select(date, close, index)
+  
+  return(data)
+}
+
+# Define the file paths and index names
+file_paths <- c(
+  "Nifty_daily.csv",  # Main NIFTY 50 index
+  "IT_daily.csv",  # IT sector index
+  "Financial_Services_daily.csv",  # Financial Services sector index
+  "Healthcare_daily.csv"    # Healthcare sector index
+)
+
+index_names <- c("NIFTY 50", "IT", "Financial Services", "Healthcare")
+
+# Read and process all datasets
+all_data <- data.frame()
+for (i in 1:length(file_paths)) {
+  # Try to read the file, with error handling
+  tryCatch({
+    data <- read_process_index(file_paths[i], index_names[i])
+    all_data <- rbind(all_data, data)
+  }, error = function(e) {
+  })
+}
+
+# Basic time series plot for all indices
+ggplot(all_data, aes(x = date, y = close, color = index)) +
+  geom_line() +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Closing Prices of NIFTY Indices Over Time",
+    x = "Date",
+    y = "Closing Price",
+    color = "Index"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+```
+
+We see that all series trend upward, with occasional spikes and drawdowns—especially a big fall around 2020, and a spike in 2022. This non‑stationarity motivates differencing before classical ARIMA modeling, and a latent‑state approach in our Bayesian model.
+
+**Benchmark: ARIMA(5,1,5) with Drift**
+
+To establish a classical benchmark, we fit an ARIMA model to the log‑series of the NIFTY50. We use the log-series as it is standard practice while using financial data to use log-returns. An augmented Dickey–Fuller test on the log series returned $p\approx 0.083$, so we difference once to achieve stationarity (p\<0.01).
+
+The training set required an order of (5,1,5) with a small positive drift. We then forecast 60 trading days ahead. On the original‑scale, the metrics we obtained are: **RMSE**: 643.42, **MAE**: 553.40, **MAPE**: 2.33%
+
+These metrics suggest reasonable in‑sample fit, but the forecast plot shows essentially a straight‑line continuation of the last observed value—one of the known pitfalls of ARIMA when no strong cyclical pattern is detected.
+
+```{r,include=FALSE}
+# Read and process all index data
+nifty_data <- read.csv("Nifty_daily.csv")
+it_index <- read.csv("IT_daily.csv")
+fin_index <- read.csv("Financial_Services_daily.csv")
+health_index <- read.csv("Healthcare_daily.csv")
+
+# Convert dates and log-transform closing prices
+prepare_data <- function(data) {
+  data$date <- as.Date(data$date, format="%Y-%m-%d %H:%M:%S")
+  data$log_close <- log(data$close)
+  return(data[order(data$date), ])
+}
+
+nifty_data <- prepare_data(nifty_data)
+it_index <- prepare_data(it_index)
+fin_index <- prepare_data(fin_index)
+health_index <- prepare_data(health_index)
+
+# Align dates across all datasets (inner join)
+all_dates <- as.Date(Reduce(intersect, list(nifty_data$date, 
+                                                  it_index$date, 
+                                                  fin_index$date, 
+                                                  health_index$date)),
+                     origin = "1970-01-01")
+
+# Prepare the data for the state-space model
+# Define the forecast horizon
+forecast_horizon <- 60  # 60 days ahead
+
+# Split data into training and testing
+train_cutoff <- length(all_dates) - forecast_horizon
+training_dates <- all_dates[1:train_cutoff]
+test_dates <- all_dates[(train_cutoff+1):length(all_dates)]
+
+
+# Prepare the data, average the log_close for duplicate dates
+nifty_train <- nifty_data %>%
+  group_by(date) %>%
+  summarise(log_close = mean(log_close)) %>%
+  filter(date %in% training_dates)
+
+it_train <- it_index %>%
+  group_by(date) %>%
+  summarise(log_close = mean(log_close)) %>%
+  filter(date %in% training_dates)
+
+fin_train <- fin_index %>%
+  group_by(date) %>%
+  summarise(log_close = mean(log_close)) %>%
+  filter(date %in% training_dates)
+
+health_train <- health_index %>%
+  group_by(date) %>%
+  summarise(log_close = mean(log_close)) %>%
+  filter(date %in% training_dates)
+
+nifty_test <- nifty_data %>%
+  group_by(date) %>%
+  summarise(log_close = mean(log_close)) %>%
+  filter(date %in% test_dates)
+
+
+
+train_y_main <- nifty_train$log_close
+train_y_sectors <- cbind(it_train$log_close, fin_train$log_close, health_train$log_close)
+test_y_main <- nifty_test$log_close
+```
+
+```{r, echo=FALSE, warning=FALSE}
+
+# Check for stationarity
+adf_test <- adf.test(train_y_main)
+
+# If not stationary (p > 0.05), take differences
+if (adf_test$p.value > 0.05) {
+  diff_data <- diff(train_y_main)
+  adf_test_diff <- adf.test(diff_data)
+}
+
+# Auto ARIMA model with seasonal=TRUE
+auto_model <- auto.arima(train_y_main, seasonal = TRUE, stepwise = TRUE)
+
+# Make forecasts in log space
+forecast_periods <- length(test_y_main)
+log_forecasts <- forecast(auto_model, h = forecast_periods)
+
+# Convert forecasts back to original scale
+forecasts_original_scale <- exp(log_forecasts$mean)
+lower_95_original <- exp(log_forecasts$lower[,2])
+upper_95_original <- exp(log_forecasts$upper[,2])
+
+# Convert test data back to original scale for comparison
+test_data_original <- exp(test_y_main)
+
+# Calculate error metrics in original scale
+forecast_errors <- test_data_original - forecasts_original_scale
+rmse <- sqrt(mean(forecast_errors^2))
+mae <- mean(abs(forecast_errors))
+mape <- mean(abs(forecast_errors/test_data_original)) * 100
+
+
+# Also plot the log-scale data and forecasts for comparison
+log_forecast_df <- data.frame(
+  date = test_dates,
+  actual = as.numeric(test_y_main),
+  forecast = as.numeric(log_forecasts$mean),
+  lower_95 = as.numeric(log_forecasts$lower[,2]),
+  upper_95 = as.numeric(log_forecasts$upper[,2])
+)
+
+ggplot(log_forecast_df, aes(x = date)) +
+  geom_line(aes(y = actual, color = "Actual"), size = 1) +
+  geom_line(aes(y = forecast, color = "Forecast"), size = 1) +
+  geom_ribbon(aes(ymin = lower_95, ymax = upper_95), fill = "blue", alpha = 0.2) +
+  scale_color_manual(values = c("Actual" = "black", "Forecast" = "blue")) +
+  labs(
+    title = "NIFTY 50 ARIMA Forecast vs Actual (Log scale)",
+    x = "Date",
+    y = "Log of Closing Price",
+    color = ""
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+Because ARIMA struggles to capture structural trends here, we next turn to a Bayesian state‑space model.
+
+**Bayesian State‑Space Model**
+
+We posit a latent state $s_t$​ for the NIFTY50 log‑price that evolves autoregressively, with contemporaneous “shock” inputs from the first differences of the sector indices. Formally: \begin{align*}s_t &\sim N\bigg(\phi s_{t-1}+\sum_{k=1}^K \beta_k (y_{\text{sector}, t-1, k}-y_{\text{sector},t-2,k}), \sigma_{\text{state}}^2\bigg)\\y_{\text{main},t}&\sim N(s_t, \sigma_{\text{obs}}^2)\end{align*}
+
+We choose the priors as: \begin{align*}
+s_1 &\sim N(y_{\text{main},1}, 0.1)\\
+\sigma_\text{obs}, \sigma_\text{state} &\sim \text{Exp}(10) \\
+B_k &\sim N(0,0.5)\\
+\phi&\sim N(0.9,0.1)
+\end{align*}
+
+To address potential non-stationarity, first differences were taken for the sector indices within the Stan model, allowing the latent state to capture long-term trends while sector differences represent short-term market shocks. The main index (y_main) was left undifferenced, as its trends are modeled through a latent state process with autoregressive dynamics. This modeling choice aligns with common practices in Bayesian state-space modeling, where the state component evolves independently and captures underlying structural trends, while avoiding unnecessary preprocessing.
+
+The prior for the variances being selected as $\text{Exp}(10)$ reflects the belief that the markets do not change drastically in one day, and hence have some form of stability. It is also noteworthy to remember that we are dealing in the log-scale, and hence the values will be smaller in general. The other prior choice regarding $\phi\,\,\,\text{and} \,\,\, \beta$ reflects our belief in high persistence and modest sector influence. Several alternatives were tested with these resulting in the best relative results. We run 4 chains, 10,000 iterations with half of them as warmup.
+
+```{r, include=FALSE}
+stan_code <- "
+data {
+  int<lower=0> N;                  // Number of time points (training)
+  int<lower=0> H;                  // Forecast horizon
+  int<lower=0> K;                  // Number of sector indices
+  vector[N] y_main;                // Log-transformed NIFTY 50 (training)
+  matrix[N, K] y_sectors;          // Log-transformed sector indices (training)
+}
+parameters {
+  // State-space parameters
+  real<lower=0> sigma_obs;         // Observation noise
+  real<lower=0> sigma_state;       // State evolution noise
+  vector[N] states;                // Latent states
+  
+  // Sector influence parameters
+  vector[K] beta;                  // Sector coefficients
+
+  // AR parameter for state evolution
+  real<lower=-1, upper=1> phi;     // Persistence parameter
+}
+model {
+  // Priors
+  sigma_obs ~ exponential(10);      // Tighter prior for stability
+  sigma_state ~ exponential(10);    // Tighter prior for stability
+  phi ~ normal(0.9, 0.1);          // Prior centered at high persistence
+  beta ~ normal(0, 0.5);           // Sector influence priors
+  
+  // Initial state prior
+  states[1] ~ normal(y_main[1], 0.1);
+  
+  // State evolution with sector influences
+  // Start from t=3 to avoid indexing issues when calculating differences
+  for (t in 3:N) {
+    real mu = phi * states[t-1];
+    
+    // Add sector influences (using first differences)
+    for (k in 1:K) {
+      mu += beta[k] * (y_sectors[t-1, k] - y_sectors[t-2, k]);
+    }
+    
+    states[t] ~ normal(mu, sigma_state);
+  }
+  
+  // Special case for t=2 without using differences
+  states[2] ~ normal(phi * states[1], sigma_state);
+  
+  // Observation equation
+  y_main ~ normal(states, sigma_obs);
+}
+generated quantities {
+  // Forecast future states and observations
+  vector[H] future_states;
+  vector[H] forecasts;
+  
+  // Initialize with last state and sector changes
+  future_states[1] = phi * states[N];
+  
+  // Add sector influences for first forecast
+  if (N >= 2) {
+    for (k in 1:K) {
+      future_states[1] += beta[k] * (y_sectors[N, k] - y_sectors[N-1, k]);
+    }
+  }
+  
+  // Generate first forecast
+  forecasts[1] = normal_rng(future_states[1], sigma_obs);
+  
+  // Generate remaining forecasts (assuming sector changes=0 for simplicity)
+  for (h in 2:H) {
+    future_states[h] = phi * future_states[h-1];
+    forecasts[h] = normal_rng(future_states[h], sigma_obs);
+  }
+}
+"
+  
+# Compile the model
+efficient_state_space_model <- stan_model(model_code = stan_code)
+```
+
+```{r, message = FALSE, results = 'hide', warning=FALSE, include=FALSE}
+
+set.seed(535)
+# Prepare the data for the state-space model
+# Make sure to calculate differences for sector indices
+stan_ss_data <- list(
+  N = length(training_dates),
+  H = forecast_horizon,
+  K = 3,  # Number of sector indices
+  y_main = train_y_main,
+  y_sectors = as.matrix(train_y_sectors)
+)
+
+# Fit the state-space model with more efficient settings
+ss_fit <- rstan::sampling(
+  efficient_state_space_model, 
+  data = stan_ss_data,
+  chains = 4, 
+  iter = 10000,  # Reduced iterations for speed
+  warmup = 5000,
+  thin = 2,     # Thinning to reduce memory usage
+  control = list(
+    adapt_delta = 0.9,
+    max_treedepth = 10
+  )
+)
+```
+
+```{r, echo=FALSE, results='hide', message=FALSE}
+
+# Check for warnings and convergence
+check_hmc_diagnostics(ss_fit)
+print(ss_fit, pars = c("sigma_obs", "sigma_state", "phi", "beta"))
+
+# Extract forecasts
+posterior_samples <- rstan::extract(ss_fit)
+forecasts <- posterior_samples$forecasts
+
+# Calculate forecast statistics
+forecast_mean <- colMeans(forecasts)
+forecast_lower <- apply(forecasts, 2, quantile, probs = 0.025)
+forecast_upper <- apply(forecasts, 2, quantile, probs = 0.975)
+
+# Convert forecasts back to original scale
+forecast_mean_original <- exp(forecast_mean)
+forecast_lower_original <- exp(forecast_lower)
+forecast_upper_original <- exp(forecast_upper)
+
+# Get actual values for comparison
+actual_values <- nifty_data$close[nifty_data$date %in% test_dates]
+
+# Create a data frame for plotting
+forecast_df <- data.frame(
+  date = test_dates,
+  actual = actual_values,
+  forecast = forecast_mean_original,
+  lower_95 = forecast_lower_original,
+  upper_95 = forecast_upper_original
+)
+
+# Calculate error metrics
+rmse_ss <- sqrt(mean((actual_values - forecast_mean_original)^2))
+mae_ss <- mean(abs(actual_values - forecast_mean_original))
+mape_ss <- mean(abs((actual_values - forecast_mean_original)/actual_values)) * 100
+
+cat("State-Space Model Performance:\n")
+cat("RMSE:", rmse_ss, "\n")
+cat("MAE:", mae_ss, "\n")
+cat("MAPE:", mape_ss, "%\n")
+
+# Plot the forecasts
+ggplot(forecast_df, aes(x = date)) +
+  geom_line(aes(y = actual, color = "Actual"), size = 1) +
+  geom_line(aes(y = forecast, color = "Forecast"), size = 1) +
+  geom_ribbon(aes(ymin = lower_95, ymax = upper_95), fill = "blue", alpha = 0.2) +
+  scale_color_manual(values = c("Actual" = "black", "Forecast" = "blue")) +
+  labs(
+    title = "NIFTY 50 State-Space Bayesian Forecast vs Actual",
+    x = "Date",
+    y = "Closing Price",
+    color = ""
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+# Extract and analyze parameter estimates
+beta_samples <- posterior_samples$beta
+colnames(beta_samples) <- c("IT", "Financial", "Healthcare")
+
+# Calculate mean and 95% CI for each beta
+beta_summary <- data.frame(
+  Sector = c("IT", "Financial", "Healthcare"),
+  Mean = colMeans(beta_samples),
+  Lower_CI = apply(beta_samples, 2, quantile, probs = 0.025),
+  Upper_CI = apply(beta_samples, 2, quantile, probs = 0.975)
+)
+
+#print(beta_summary)
+```
+
+**Bayesian Model Diagnostics and Forecast**
+
+Posterior diagnostics revealed mixing issues with low E-BFMI values (\<0.2), low effective sample sizes for non-phi parameters, and elevated R-hat values for some parameters, all suggesting poor mixing and potential issues with the posterior geometry. Although, the trace plots (Appendix) show moderate to good mixing and stationarity across all four chains overall for all parameters. The phi parameter is consistently near 1, suggesting strong persistence in the latent state but warranting caution due to its proximity to the upper bound. Other MCMC diagnostics appear stable, with no signs of divergence or tree depth saturation. In addition, the out‑of‑sample forecasts achieved have the accuracy metrics of: **RMSE**: 561.29, **MAE**: 436.87, **MAPE**: 1.81%. Although metrics slightly improve over ARIMA, the forecast again appears nearly flat due to the highly persistent latent component.
+
+**Kalman Filtering on NIFTY50**
+
+Finally, we apply a robust Kalman filter (via the `dlm` package) to the log‑series. Kalman filtering has the advantage of exact recursive estimation and fast computation, with well‐understood Gaussian updates.
+
+```{r, echo=FALSE}
+
+# Robust State-Space Model with Kalman Filter for NIFTY 50
+
+# Function to build more numerically stable state space model
+build_robust_ss_model <- function(data, model_params) {
+  # Extract parameters
+  ar_order <- model_params$ar_order
+  include_trend <- model_params$include_trend
+  
+  # Calculate data scale for numerical stability
+  data_scale <- sd(data, na.rm = TRUE)
+  
+  # Initial state space model with scaled variances
+  if (include_trend) {
+    # Model with local linear trend - using more stable parameterization
+    model <- dlmModPoly(order = 2)
+    
+    # Set observation variance with more stable scaling
+    V(model) <- exp(model_params$log_obs_var) * (data_scale^2)
+    
+    # Set system variances with better scaling
+    W(model) <- diag(c(
+      exp(model_params$log_level_var) * (data_scale^2),
+      exp(model_params$log_trend_var) * (data_scale^2)
+    ))
+  } else {
+    # Model with random walk plus noise - using more stable parameterization
+    model <- dlmModPoly(order = 1)
+    
+    # Set observation variance with more stable scaling
+    V(model) <- exp(model_params$log_obs_var) * (data_scale^2)
+    
+    # Set system variance with better scaling
+    W(model) <- exp(model_params$log_level_var) * (data_scale^2)
+  }
+  
+  # Add AR component if requested (with improved numerical stability)
+  if (ar_order > 0) {
+    # Create AR model with better numerical properties
+    ar_coefs <- pmin(pmax(model_params$ar_coefs, -0.99), 0.99)  # Ensure stability
+    ar_model <- dlmModARMA(ar = ar_coefs)
+    
+    # Scale AR variance
+    V(ar_model) <- 0  # No observation component for AR part
+    W(ar_model) <- diag(rep(exp(model_params$log_ar_var) * (data_scale^2), ar_order))
+    
+    # Combine models
+    model <- model + ar_model
+  }
+  
+  return(model)
+}
+
+# Function to tune the model using maximum likelihood with better numerical properties
+tune_robust_ss_model <- function(data, ar_order = 1, include_trend = TRUE) {
+  # Initial parameter values with better scaling
+  data_var <- var(diff(data), na.rm = TRUE)
+  
+  init_params <- list(
+    log_obs_var = log(data_var * 0.2),
+    log_level_var = log(data_var * 0.02),
+    include_trend = include_trend,
+    ar_order = ar_order
+  )
+  
+  if (include_trend) {
+    init_params$log_trend_var <- log(var(diff(diff(data)), na.rm = TRUE) * 0.05)
+  }
+  
+  if (ar_order > 0) {
+    # Use more stable initial AR coefficients
+    ar_fit <- try(ar(na.omit(diff(data)), aic = FALSE, order.max = ar_order), silent = TRUE)
+    if (!inherits(ar_fit, "try-error") && !is.null(ar_fit$ar)) {
+      init_params$ar_coefs <- ar_fit$ar
+      # Ensure coefficients are within stable range
+      init_params$ar_coefs <- pmin(pmax(init_params$ar_coefs, -0.9), 0.9)
+    } else {
+      init_params$ar_coefs <- rep(0.1, ar_order)
+    }
+    
+    init_params$log_ar_var <- log(data_var * 0.1)
+  }
+  
+  # Define parameters to be optimized
+  param_names <- c("log_obs_var", "log_level_var")
+  if (include_trend) param_names <- c(param_names, "log_trend_var")
+  if (ar_order > 0) {
+    param_names <- c(param_names, paste0("ar_coefs", 1:ar_order), "log_ar_var")
+  }
+  
+  # Initial parameter vector for optimization
+  init_vec <- numeric(length(param_names))
+  for (i in 1:length(param_names)) {
+    if (grepl("ar_coefs", param_names[i])) {
+      ar_idx <- as.integer(gsub("ar_coefs", "", param_names[i]))
+      init_vec[i] <- init_params$ar_coefs[ar_idx]
+    } else {
+      init_vec[i] <- init_params[[param_names[i]]]
+    }
+  }
+  
+  # Objective function for minimization with better error handling
+  obj_func <- function(params) {
+    # Convert parameter vector back to list
+    param_list <- init_params
+    for (i in 1:length(param_names)) {
+      if (grepl("ar_coefs", param_names[i])) {
+        ar_idx <- as.integer(gsub("ar_coefs", "", param_names[i]))
+        param_list$ar_coefs[ar_idx] <- params[i]
+      } else {
+        param_list[[param_names[i]]] <- params[i]
+      }
+    }
+    
+    # Handle AR coefficient constraints explicitly
+    if (ar_order > 0) {
+      param_list$ar_coefs <- pmin(pmax(param_list$ar_coefs, -0.99), 0.99)
+    }
+    
+    # Build the model with error handling
+    tryCatch({
+      model <- build_robust_ss_model(data, param_list)
+      
+      # Calculate negative log-likelihood with error handling
+      fit <- tryCatch({
+        dlmLL(model, data)
+      }, error = function(e) {
+        return(NA)
+      })
+      
+      if (is.na(fit) || is.infinite(fit)) {
+        return(1e10)  # Return high value for bad fits
+      }
+      
+      return(-fit)  # Return negative log-likelihood
+    }, error = function(e) {
+      return(1e10)  # Return high value on error
+    })
+  }
+  
+  # Perform optimization with better handling
+  opt_result <- try(optim(
+    init_vec, 
+    obj_func, 
+    method = "BFGS", 
+    control = list(maxit = 500, parscale = abs(init_vec) + 0.1)
+  ), silent = TRUE)
+  
+  # Handle optimization failures gracefully
+  if (inherits(opt_result, "try-error") || opt_result$convergence != 0) {
+    # Try again with more robust but slower Nelder-Mead method
+    opt_result <- try(optim(
+      init_vec, 
+      obj_func, 
+      method = "Nelder-Mead", 
+      control = list(maxit = 1000)
+    ), silent = TRUE)
+  }
+  
+  # Create optimized parameter list
+  opt_params <- init_params
+  if (!inherits(opt_result, "try-error")) {
+    for (i in 1:length(param_names)) {
+      if (grepl("ar_coefs", param_names[i])) {
+        ar_idx <- as.integer(gsub("ar_coefs", "", param_names[i]))
+        opt_params$ar_coefs[ar_idx] <- opt_result$par[i]
+      } else {
+        opt_params[[param_names[i]]] <- opt_result$par[i]
+      }
+    }
+    
+    # Ensure AR coefficients are within stable range
+    if (ar_order > 0) {
+      opt_params$ar_coefs <- pmin(pmax(opt_params$ar_coefs, -0.99), 0.99)
+    }
+    
+    # Build the final model with error handling
+    final_model <- try(build_robust_ss_model(data, opt_params), silent = TRUE)
+    
+    if (inherits(final_model, "try-error")) {
+      # Fall back to simpler model
+      message("Falling back to simpler model due to numerical issues")
+      opt_params$ar_order <- 0
+      opt_params$include_trend <- FALSE
+      final_model <- build_robust_ss_model(data, opt_params)
+    }
+    
+    return(list(
+      model = final_model, 
+      params = opt_params, 
+      loglik = if (!inherits(opt_result, "try-error")) -opt_result$value else -1e10,
+      converged = if (!inherits(opt_result, "try-error")) opt_result$convergence == 0 else FALSE
+    ))
+  } else {
+    # Fall back to very simple model
+    message("Optimization failed, using simple random walk model")
+    opt_params$ar_order <- 0
+    opt_params$include_trend <- FALSE
+    final_model <- dlmModPoly(order = 1, dV = var(diff(data), na.rm = TRUE) * 0.2, 
+                              dW = var(diff(data), na.rm = TRUE) * 0.02)
+    
+    return(list(
+      model = final_model, 
+      params = opt_params, 
+      loglik = -1e10,
+      converged = FALSE
+    ))
+  }
+}
+
+# Function to forecast using Kalman filter model with robust error handling
+robust_forecast_ss_model <- function(model, data, h = 10) {
+  # Filter the data with error handling
+  filtered <- tryCatch({
+    dlmFilter(data, model)
+  }, error = function(e) {
+    message("Error in filtering: ", e$message)
+    # Fall back to a simpler model if filtering fails
+    simple_model <- dlmModPoly(order = 1, dV = var(data, na.rm = TRUE) * 0.1, 
+                              dW = var(diff(data), na.rm = TRUE) * 0.01)
+    dlmFilter(data, simple_model)
+  })
+  
+  # Smooth the states (with error handling)
+  smoothed <- tryCatch({
+    dlmSmooth(filtered)
+  }, error = function(e) {
+    message("Error in smoothing: ", e$message)
+    # Create dummy smoothed object if smoothing fails
+    list(s = filtered$m)
+  })
+  
+  # Create fitted values
+  fitted <- c(NA, filtered$f[-1])  # First value is NA
+  
+  # Create residuals
+  residuals <- data - fitted
+  
+  # Forecast h steps ahead (with error handling)
+  tryCatch({
+    forecast_result <- dlmForecast(filtered, nAhead = h)
+    
+    # Extract forecasts and forecast variances
+    forecasts <- forecast_result$f
+    forecast_vars <- forecast_result$Q
+    
+    # Calculate prediction intervals
+    lower_95 <- forecasts - 1.96 * sqrt(forecast_vars)
+    upper_95 <- forecasts + 1.96 * sqrt(forecast_vars)
+    
+    return(list(
+      forecasts = forecasts,
+      forecast_vars = forecast_vars,
+      lower_95 = lower_95,
+      upper_95 = upper_95,
+      fitted = fitted,
+      residuals = residuals,
+      filtered_states = filtered$m,
+      smoothed_states = smoothed$s
+    ))
+  }, error = function(e) {
+    message("Error in forecasting: ", e$message)
+    
+    # Create simple forecasts as fallback
+    simple_forecasts <- rep(tail(data, 1), h)
+    simple_vars <- seq(var(diff(data), na.rm = TRUE), 
+                      var(diff(data), na.rm = TRUE) * h, 
+                      length.out = h)
+    
+    return(list(
+      forecasts = simple_forecasts,
+      forecast_vars = simple_vars,
+      lower_95 = simple_forecasts - 1.96 * sqrt(simple_vars),
+      upper_95 = simple_forecasts + 1.96 * sqrt(simple_vars),
+      fitted = fitted,
+      residuals = residuals,
+      filtered_states = filtered$m,
+      smoothed_states = if (exists("smoothed")) smoothed$s else filtered$m
+    ))
+  })
+}
+
+# Function to run the complete analysis with error handling
+analyze_nifty_robust <- function(train_data, test_data = NULL, train_dates = NULL, test_dates = NULL, h = NULL) {
+  # Set default horizon if not provided
+  if (is.null(h)) {
+    h <- if (!is.null(test_data)) length(test_data) else 10
+  }
+  
+  # Ensure train_data has no missing values
+  if (any(is.na(train_data))) {
+    warning("Training data contains missing values. Interpolating...")
+    train_data <- na.interp(train_data)
+  }
+  
+  # Step 1: Convert to log scale if not already (with error handling)
+  log_train <- if(all(train_data > 0, na.rm = TRUE)) {
+    log(train_data)
+  } else {
+    # If data is already on log scale or has negative values
+    if (any(train_data <= 0, na.rm = TRUE)) {
+      warning("Data contains non-positive values. Assuming data is not on log scale.")
+      # Apply a transformation to make all values positive
+      min_val <- min(train_data, na.rm = TRUE)
+      if (min_val <= 0) {
+        train_data - min_val + 1  # Shift data to be positive
+      } else {
+        train_data
+      }
+    } else {
+      train_data  # Keep as is if likely already log-transformed
+    }
+  }
+  
+  # Step 2: Try different models with robust error handling
+  models <- list()
+  
+  # Try models with different configurations
+  model_configs <- list(
+    rw = list(ar_order = 0, include_trend = FALSE),
+    rw_trend = list(ar_order = 0, include_trend = TRUE),
+    ar1 = list(ar_order = 1, include_trend = FALSE),
+    ar1_trend = list(ar_order = 1, include_trend = TRUE)
+  )
+  
+  for (config_name in names(model_configs)) {
+    config <- model_configs[[config_name]]
+    
+    message("Fitting model: ", config_name)
+    models[[config_name]] <- tryCatch({
+      tune_robust_ss_model(log_train, 
+                          ar_order = config$ar_order, 
+                          include_trend = config$include_trend)
+    }, error = function(e) {
+      message("Error fitting model ", config_name, ": ", e$message)
+      # Return a failed model indicator
+      list(loglik = -Inf, converged = FALSE)
+    })
+  }
+  
+  # Find model with highest log-likelihood among converged models
+  converged_models <- sapply(models, function(x) x$converged)
+  if (any(converged_models)) {
+    logliks <- sapply(models, function(x) if(x$converged) x$loglik else -Inf)
+    best_model_name <- names(which.max(logliks))
+    best_model <- models[[best_model_name]]
+  } else {
+    # If no models converged, use the simplest random walk model
+    message("No models converged properly. Using simple random walk model.")
+    best_model_name <- "fallback_rw"
+    fallback_model <- dlmModPoly(order = 1, 
+                                dV = var(diff(log_train), na.rm = TRUE) * 0.2,
+                                dW = var(diff(log_train), na.rm = TRUE) * 0.02)
+    best_model <- list(
+      model = fallback_model,
+      params = list(ar_order = 0, include_trend = FALSE),
+      loglik = NA,
+      converged = TRUE
+    )
+  }
+  
+  message("Selected model: ", best_model_name)
+  
+  # Step 3: Forecast using the best model with robust handling
+  forecast_results <- robust_forecast_ss_model(best_model$model, log_train, h = h)
+  
+  # Step 4: Convert forecasts back to original scale
+  orig_forecasts <- exp(forecast_results$forecasts)
+  orig_lower <- exp(forecast_results$lower_95)
+  orig_upper <- exp(forecast_results$upper_95)
+  orig_fitted <- exp(forecast_results$fitted)
+  
+  # Step 5: Calculate performance metrics
+  metrics <- NULL
+  if(!is.null(test_data) && length(test_data) > 0) {
+    # Make sure test data length matches forecast length
+    test_subset <- test_data[1:min(length(test_data), length(orig_forecasts))]
+    forecast_subset <- orig_forecasts[1:min(length(test_data), length(orig_forecasts))]
+    
+    rmse <- sqrt(mean((test_subset - forecast_subset)^2, na.rm = TRUE))
+    mae <- mean(abs(test_subset - forecast_subset), na.rm = TRUE)
+    mape <- mean(abs((test_subset - forecast_subset)/test_subset) * 100, na.rm = TRUE)
+    
+    metrics <- c(rmse = rmse, mae = mae, mape = mape)
+    
+    message("Forecast Performance:")
+    message("RMSE: ", rmse)
+    message("MAE: ", mae)
+    message("MAPE: ", mape, "%")
+  }
+  
+  # Step 6: Create forecast dataframe
+  forecast_df <- data.frame(
+    forecast = orig_forecasts,
+    lower_95 = orig_lower,
+    upper_95 = orig_upper
+  )
+  
+  if(!is.null(test_dates) && length(test_dates) > 0) {
+    # Only use as many test dates as we have forecasts
+    date_count <- min(length(test_dates), nrow(forecast_df))
+    forecast_df$date <- test_dates[1:date_count]
+  }
+  
+  if(!is.null(test_data) && length(test_data) > 0) {
+    # Only use as many test values as we have forecasts
+    value_count <- min(length(test_data), nrow(forecast_df))
+    forecast_df$actual <- test_data[1:value_count]
+  }
+  
+  # Step 7: Create in-sample fit dataframe
+  fit_df <- data.frame(
+    fitted = orig_fitted
+  )
+  
+  if(!is.null(train_dates) && length(train_dates) > 0) {
+    fit_df$date <- train_dates[1:min(length(train_dates), length(orig_fitted))]
+  }
+  
+  fit_df$actual <- train_data[1:min(length(train_data), length(orig_fitted))]
+  
+  # Step 8: Return results
+  return(list(
+    model = best_model,
+    model_name = best_model_name,
+    forecasts = forecast_df,
+    fitted = fit_df,
+    residuals = forecast_results$residuals,
+    metrics = metrics
+  ))
+}
+
+# Function to plot results with better error handling
+plot_nifty_results <- function(results, title = "NIFTY 50 Forecast") {
+  # Plot forecasts if we have date and actual columns
+  forecast_plots <- list()
+  
+  if (all(c("date", "actual") %in% colnames(results$forecasts))) {
+    p1 <- ggplot(results$forecasts, aes(x = date)) +
+      geom_ribbon(aes(ymin = lower_95, ymax = upper_95), fill = "blue", alpha = 0.2) +
+      geom_line(aes(y = actual, color = "Actual"), size = 1) +
+      geom_line(aes(y = forecast, color = "Forecast"), size = 1) +
+      scale_color_manual(values = c("Actual" = "black", "Forecast" = "blue")) +
+      labs(
+        title = paste(title, "- Out of Sample"),
+        subtitle = if(!is.null(results$metrics)) {
+          paste("MAPE:", round(results$metrics["mape"], 2), "%")
+        } else {
+          ""
+        },
+        x = "Date",
+        y = "NIFTY 50 Price",
+        color = ""
+      ) +
+      theme_minimal() +
+      theme(legend.position = "bottom")
+    
+    forecast_plots$forecast_comparison <- p1
+  } else {
+    message("Skipping forecast comparison plot: missing date or actual data")
+  }
+  
+  # Plot fitted values if we have date column
+  fitted_plots <- list()
+  
+  if (all(c("date", "actual") %in% colnames(results$fitted))) {
+    p2 <- ggplot(results$fitted, aes(x = date)) +
+      geom_line(aes(y = actual, color = "Actual"), size = 1) +
+      geom_line(aes(y = fitted, color = "Fitted"), size = 1) +
+      scale_color_manual(values = c("Actual" = "black", "Fitted" = "blue")) +
+      labs(
+        title = paste(title, "- In Sample Fit"),
+        x = "Date",
+        y = "NIFTY 50 Price",
+        color = ""
+      ) +
+      theme_minimal() +
+      theme(legend.position = "bottom")
+    
+    fitted_plots$fitted_comparison <- p2
+  } else {
+    message("Skipping fitted comparison plot: missing date or actual data")
+  }
+  
+  # Plot residual diagnostics if we have residuals
+  if (length(results$residuals) > 0) {
+    # Remove NA residuals
+    clean_residuals <- results$residuals[!is.na(results$residuals)]
+    
+    if (length(clean_residuals) > 0) {
+      par(mfrow = c(2, 2))
+      plot(clean_residuals, type = "l", main = "Residuals over time", 
+           xlab = "Time", ylab = "Residuals")
+      abline(h = 0, col = "red", lty = 2)
+      acf(clean_residuals, main = "ACF of residuals", na.action = na.pass)
+      hist(clean_residuals, breaks = 30, main = "Histogram of residuals", 
+           xlab = "Residuals")
+      qqnorm(clean_residuals)
+      qqline(clean_residuals, col = "red")
+      par(mfrow = c(1, 1))
+    } else {
+      message("Skipping residual plots: no valid residuals")
+    }
+  } else {
+    message("Skipping residual plots: no residuals available")
+  }
+  
+  return(list(forecast_plots = forecast_plots, fitted_plots = fitted_plots))
+}
+
+# Example usage function
+run_nifty_analysis <- function(train_data, test_data = NULL, 
+                               train_dates = NULL, test_dates = NULL) {
+  
+  # Run the robust analysis
+  message("Analyzing NIFTY 50 data with robust Kalman filter...")
+  results <- analyze_nifty_robust(
+    train_data = train_data,
+    test_data = test_data,
+    train_dates = train_dates,
+    test_dates = test_dates
+  )
+  
+  # Plot the results
+  message("Generating plots...")
+  plots <- plot_nifty_results(results, title = "NIFTY 50 Kalman Filter Model")
+  
+  # Print model details
+  message("\nBest Model: ", results$model_name)
+  
+  # Print performance metrics
+  if (!is.null(results$metrics)) {
+    message("\nForecast Performance:")
+    message("RMSE: ", round(results$metrics["rmse"], 2))
+    message("MAE: ", round(results$metrics["mae"], 2))
+    message("MAPE: ", round(results$metrics["mape"], 2), "%")
+  }
+  
+  return(list(results = results, plots = plots))
+}
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.height=5, fig.width=7, include=FALSE}
+
+# Define the forecast horizon
+forecast_horizon <- 60
+
+# Split data into training and testing
+train_cutoff <- length(all_dates) - forecast_horizon
+training_dates <- all_dates[1:train_cutoff]
+test_dates <- all_dates[(train_cutoff+1):length(all_dates)]
+
+
+# 1. Aggregate and split
+nifty_by_day <- nifty_data %>%
+  group_by(date) %>%
+  summarise(close = mean(close))
+
+# 2. Create train and test data frames
+nifty_train_df <- nifty_by_day %>% filter(date %in% training_dates)
+nifty_test_df  <- nifty_by_day %>% filter(date %in% test_dates)
+
+# 3. Extract numeric vectors
+train_nifty <- nifty_train_df$close
+test_nifty  <- nifty_test_df$close
+
+train_nifty <- as.numeric(nifty_train_df$close)
+test_nifty <- as.numeric(nifty_test_df$close)
+
+
+
+# Running the code with our data:
+result <- run_nifty_analysis(
+  train_data = train_nifty,
+  test_data = test_nifty,
+  train_dates = training_dates,
+  test_dates = test_dates
+)
+
+# Access the results
+model_results <- result$results
+forecast_plot <- result$plots$forecast_plots$forecast_comparison
+fitted_plot <- result$plots$fitted_plots$fitted_comparison
+
+
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# Display plots
+print(forecast_plot)
+
+```
+
+The model selection routine chose a simple random‐walk model as the best one: \begin{align*}
+s_t &= s_{t-1} + \eta_t, \quad \eta_t \sim N(0, W) \\
+y_t &= s_t + \epsilon_t, \quad \epsilon_t \sim N(0, V)
+\end{align*}
+
+This yielded: **RMSE**: 556.49, **MAE**: 434.01, **MAPE**: 1.81%
+
+Residual diagnostics (Appendix) show patternless residuals centered at zero, roughly Gaussian in the QQ‐plot, indicating good in‐sample fit. The in-sample fit (Appendix) is also supported by the graph which shows the fitted values closely following the actual values. However, the out‑of‑sample forecast is again a flat line, reflecting the random‑walk.
+
+**Conclusion**
+
+All 3 approaches—ARIMA, Bayesian MCMC, and Kalman filtering— are producing similar flat forecasts, even though they yield a low MAPE (\<3%), indicating a good fit, albeit with MCMC and Kalman filtering having slightly lower MAPE than the ARIMA model.
+
+The MCMC convergence issues (evidenced by low E-BFMI and ESS) might improve with more iterations, more chains, or refined tuning parameters. However, this would come at a significant computational cost, which is a practical constraint in the current setup.
+
+Given these limitations and the similarity of forecasts across methods, our models may be missing regime-switching dynamics or longer-term dependencies in the data. The flat forecasts suggest market efficiency during this period, where past price information alone is insufficient for prediction.
+
+Additionally, it's possible that the forecasting window selected is inherently stable or lacks significant variability — meaning that, due to coincidence or bad luck, the data in this period offers no strong patterns for the models to learn from.
+
+Future work should explore incorporating exogenous economic variables, longer lag structures, or explicit regime-switching mechanisms to better capture market dynamics.
+
+### **Citations**
+
+Azzouzi, Mehdi & Nabney, Ian. (1999). Modelling Financial Time Series with Switching State Space Models.
+
+Hendershott, T., & Menkveld, A. J. (2014). Price pressures. *Journal of Financial Economics, 114*(3), 405–423.
+
+Kane, M.J., Price, N., Scotch, M. *et al.* (2014) Comparison of ARIMA and Random Forest time series models for prediction of avian influenza H5N1 outbreaks. *BMC Bioinformatics* 15, 276.
+
+### **Appendix**
+
+**R code for the MCMC method:**
+
+```{r, echo=TRUE, eval=FALSE}
+stan_code <- "
+data {
+  int<lower=0> N;                  // Number of time points (training)
+  int<lower=0> H;                  // Forecast horizon
+  int<lower=0> K;                  // Number of sector indices
+  vector[N] y_main;                // Log-transformed NIFTY 50 (training)
+  matrix[N, K] y_sectors;          // Log-transformed sector indices (training)
+}
+parameters {
+  // State-space parameters
+  real<lower=0> sigma_obs;         // Observation noise
+  real<lower=0> sigma_state;       // State evolution noise
+  vector[N] states;                // Latent states
+  
+  // Sector influence parameters
+  vector[K] beta;                  // Sector coefficients
+
+  // AR parameter for state evolution
+  real<lower=-1, upper=1> phi;     // Persistence parameter
+}
+model {
+  // Priors
+  sigma_obs ~ exponential(10);      // Tighter prior for stability
+  sigma_state ~ exponential(10);    // Tighter prior for stability
+  phi ~ normal(0.9, 0.1);          // Prior centered at high persistence
+  beta ~ normal(0, 0.5);           // Sector influence priors
+  
+  // Initial state prior
+  states[1] ~ normal(y_main[1], 0.1);
+  
+  // State evolution with sector influences
+  // Start from t=3 to avoid indexing issues when calculating differences
+  for (t in 3:N) {
+    real mu = phi * states[t-1];
+    
+    // Add sector influences (using first differences)
+    for (k in 1:K) {
+      mu += beta[k] * (y_sectors[t-1, k] - y_sectors[t-2, k]);
+    }
+    
+    states[t] ~ normal(mu, sigma_state);
+  }
+  
+  // Special case for t=2 without using differences
+  states[2] ~ normal(phi * states[1], sigma_state);
+  
+  // Observation equation
+  y_main ~ normal(states, sigma_obs);
+}
+generated quantities {
+  // Forecast future states and observations
+  vector[H] future_states;
+  vector[H] forecasts;
+  
+  // Initialize with last state and sector changes
+  future_states[1] = phi * states[N];
+  
+  // Add sector influences for first forecast
+  if (N >= 2) {
+    for (k in 1:K) {
+      future_states[1] += beta[k] * (y_sectors[N, k] - y_sectors[N-1, k]);
+    }
+  }
+  
+  // Generate first forecast
+  forecasts[1] = normal_rng(future_states[1], sigma_obs);
+  
+  // Generate remaining forecasts (assuming sector changes=0 for simplicity)
+  for (h in 2:H) {
+    future_states[h] = phi * future_states[h-1];
+    forecasts[h] = normal_rng(future_states[h], sigma_obs);
+  }
+}
+"
+  
+# Compile the model
+efficient_state_space_model <- stan_model(model_code = stan_code)
+```
+
+```{r, message = FALSE, results = 'hide', warning=FALSE, echo=TRUE, eval=FALSE}
+
+set.seed(535)
+# Prepare the data for the state-space model
+# Make sure to calculate differences for sector indices
+stan_ss_data <- list(
+  N = length(training_dates),
+  H = forecast_horizon,
+  K = 3,  # Number of sector indices
+  y_main = train_y_main,
+  y_sectors = as.matrix(train_y_sectors)
+)
+
+# Fit the state-space model with more efficient settings
+ss_fit <- rstan::sampling(
+  efficient_state_space_model, 
+  data = stan_ss_data,
+  chains = 4, 
+  iter = 10000,  # Reduced iterations for speed
+  warmup = 5000,
+  thin = 2,     # Thinning to reduce memory usage
+  control = list(
+    adapt_delta = 0.9,
+    max_treedepth = 10
+  )
+)
+```
+
+**MCMC Trace Plots**
+
+```{r, echo=FALSE, fig.height=5, fig.width=7}
+# Check traceplots for key parameters
+rstan::traceplot(ss_fit, pars = c("sigma_obs", "sigma_state", "phi", "beta"))
+```
+
+**Kalman Filter Graphs**
+
+```{r, fig.width =8, fig.height=6, echo=FALSE, warning=FALSE, message=FALSE}
+
+# Running the code with our data:
+result <- run_nifty_analysis(
+  train_data = train_nifty,
+  test_data = test_nifty,
+  train_dates = training_dates,
+  test_dates = test_dates
+)
+
+```
+
+```{r, warning=FALSE, echo=FALSE, fig.height=4, fig.width=6}
+print(fitted_plot)
+```
